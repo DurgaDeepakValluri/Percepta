@@ -1,0 +1,170 @@
+import numpy as np
+import open3d as o3d
+import cv2
+from percepta.vo._base_vo import BaseVO  # Inherit from BaseVO
+
+
+class MonoVO(BaseVO):
+    """
+    MonoVO: A modular monocular visual odometry pipeline.
+
+    Supports:
+    - Classic feature-based motion estimation
+    - Multithreading for speed
+    - Camera intrinsic matrix input
+    - Output saving to disk
+    - Real-time and post-run visualization
+    """
+
+    def __init__(
+        self,
+        detector='ORB',
+        matcher='BF',
+        viz=None,
+        viz_only=None,
+        output_types=None,
+        camera_matrix=None,
+        frame_stride=1,
+        parallel=False,
+        input_size=None,
+        config=None
+    ):
+        """
+        Initialize MonoVO pipeline.
+
+        Parameters:
+        - detector (str): Feature detector to use.
+        - matcher (str): Feature matcher to use.
+        - viz (dict): Toggle visuals individually.
+        - viz_only (list): Visuals to enable exclusively.
+        - output_types (list): What outputs to generate.
+        - camera_matrix (ndarray): Intrinsic matrix (3x3).
+        - frame_stride (int): Frame skipping factor.
+        - parallel (bool): Enable multi-threaded processing.
+        - input_size (tuple): Resize input images to (w, h).
+        - config (Config): Optional configuration object for advanced settings.
+        """
+        super().__init__(
+            detector=detector,
+            matcher=matcher,
+            viz=viz,
+            viz_only=viz_only,
+            output_types=output_types,
+            camera_matrix=camera_matrix,
+            frame_stride=frame_stride,
+            parallel=parallel,
+            input_size=input_size,
+            config=config
+        )
+
+    def _process_frame_pair(self, pair):
+        """
+        Process a pair of frames from the input list.
+        Used in both serial and parallel modes.
+
+        Parameters:
+        - pair: Tuple containing (index, frame1, frame2).
+        """
+        i, frame1, frame2 = pair
+        R, t, points_3d = self.process_frame(frame1, frame2)
+        if R is not None and t is not None:
+            self._update_trajectory(t)
+        if points_3d is not None:
+            self._update_pointcloud(points_3d)
+
+    def process_frame(self, frame1, frame2):
+        """
+        Main pipeline step:
+        - Detect and match keypoints
+        - Estimate essential matrix
+        - Recover pose
+        - Triangulate points
+        - Optionally visualize results
+
+        Returns:
+        - R: Rotation matrix
+        - t: Translation vector
+        - points_3d: Nx3 array of 3D points
+        """
+        frame1 = self._preprocess_frame(frame1)
+        frame2 = self._preprocess_frame(frame2)
+
+        kp1, des1 = self.detector.detectAndCompute(frame1, None)
+        kp2, des2 = self.detector.detectAndCompute(frame2, None)
+
+        if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10:
+            self.logger.warning("Too few keypoints.")
+            return None, None, None
+
+        matches = self.matcher.match(des1, des2)
+        matches = sorted(matches, key=lambda x: x.distance)
+
+        if len(matches) < 8:
+            self.logger.warning("Not enough matches.")
+            return None, None, None
+
+        if self.viz.get('matches', False):
+            self.visualize_matches(frame1, frame2, kp1, kp2, matches)
+
+        points1 = np.float32([kp1[m.queryIdx].pt for m in matches])
+        points2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+
+        E, mask = cv2.findEssentialMat(points1, points2, cameraMatrix=self.K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+        if E is None:
+            return None, None, None
+
+        _, R, t, _ = cv2.recoverPose(E, points1, points2, cameraMatrix=self.K)
+        if np.isnan(R).any() or np.linalg.norm(t) > 10:
+            self.logger.warning("Unstable pose.")
+            return None, None, None
+
+        proj1 = self.K @ np.eye(3, 4)
+        proj2 = self.K @ np.hstack((R, t))
+        points_3d = cv2.triangulatePoints(proj1, proj2, points1.T, points2.T)
+        points_3d /= points_3d[3]
+
+        if 'matches' in self.output_types:
+            self.matches.append((kp1, kp2, matches))
+
+        return R, t, points_3d[:3].T
+
+    def visualize_matches(self, frame1, frame2, kp1, kp2, matches, limit=50):
+        """
+        Visualize feature matches between two frames using OpenCV.
+        """
+        f1 = cv2.cvtColor(frame1, cv2.COLOR_GRAY2BGR) if len(frame1.shape) == 2 else frame1
+        f2 = cv2.cvtColor(frame2, cv2.COLOR_GRAY2BGR) if len(frame2.shape) == 2 else frame2
+        match_img = cv2.drawMatches(f1, kp1, f2, kp2, matches[:limit], None,
+                                    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+        cv2.imshow("Feature Matches", match_img)
+        cv2.waitKey(1)
+
+    def visualize_trajectory(self):
+        """
+        Plot X-Z camera trajectory using matplotlib.
+        Only works if trajectory has >1 point.
+        """
+        if 'trajectory' not in self.output_types or len(self.trajectory) < 2:
+            self.logger.warning("No trajectory to visualize.")
+            return
+        traj = np.array(self.trajectory)
+        import matplotlib.pyplot as plt
+        plt.figure()
+        plt.plot(traj[:, 0], traj[:, 2], marker='o')
+        plt.title("Camera Trajectory (X-Z plane)")
+        plt.xlabel("X")
+        plt.ylabel("Z")
+        plt.grid()
+        plt.axis('equal')
+        plt.show()
+
+    def visualize_pointcloud(self):
+        """
+        Visualize current 3D point cloud using Open3D.
+        Skips if no points are available.
+        """
+        if self.pointcloud.is_empty():
+            self.logger.warning("Point cloud is empty. Nothing to visualize.")
+            return
+        self.logger.info(f"Showing point cloud with {len(self.pointcloud.points)} points.")
+        o3d.visualization.draw_geometries([self.pointcloud])
